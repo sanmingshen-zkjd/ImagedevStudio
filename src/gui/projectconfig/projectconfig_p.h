@@ -6,15 +6,20 @@
 #include "modeltoolbutton.h"
 #include "pcimpl.h"
 #include "ui_projectconfig.h"
+#include <QHeaderView>
+#include <QLabel>
 #include <QMenu>
+#include <QStandardItemModel>
+#include <QTableView>
 #include <QtWidgets/QPushButton>
+#include <QVBoxLayout>
 #include <log.h>
 #include <modelvisitor.h> // apply_model_visitor
 #include <nodes/Node>
-#include <propertyeditordialog.h>
 #include <bcastmsgs.h>
 #include "componentinterface.h"
 #include "plugins.hpp"
+#include <propertyfields.h>
 
 namespace Ui {
 class ProjectConfigPrivate;
@@ -46,6 +51,8 @@ public:
 
         _ui->setupUi(this);
         _ui->layout->addWidget(_graphView);
+        initPropertiesPanel();
+        _ui->layout->addWidget(_propertiesPanel);
 
         _ui->scrollArea->setMinimumSize(165, 0);
         _ui->scrollArea->setMaximumSize(165, 10000);
@@ -137,6 +144,10 @@ public:
 
         emit q->handleWidgetDeletion(component.mainWidget());
 
+        if (_activeNode == &node) {
+            clearPropertiesPanel();
+        }
+
         QJsonObject msg = initBcast(node);
         msg["msg"] = BcastMsg::NodeDeleted;
 
@@ -149,12 +160,15 @@ public:
 
         cds_debug("Node '{}' double clicked", node.nodeDataModel()->caption().toStdString());
 
+        if (!_simStarted) {
+            // Keep parameter editing consistent with the new UX:
+            // always open the inline right-side properties panel.
+            openProperties(node);
+            return;
+        }
+
         if (component.mainWidget() != nullptr) {
             openWidget(node);
-        } else {
-            if (!_simStarted) {
-                _pcInt.openProperties(node);
-            }
         }
     }
 
@@ -169,7 +183,7 @@ public:
         connect(&actionOpen, &QAction::triggered, [this, &node]() { openWidget(node); });
 
         QAction actionProperties("Properties", this);
-        connect(&actionProperties, &QAction::triggered, [this, &node]() { _pcInt.openProperties(node); });
+        connect(&actionProperties, &QAction::triggered, [this, &node]() { openProperties(node); });
 
         if (_simStarted) {
             actionProperties.setDisabled(true);
@@ -259,6 +273,126 @@ private:
         return msg;
     }
 
+    void initPropertiesPanel()
+    {
+        _propertiesPanel = new QWidget(this);
+        _propertiesPanel->setMinimumWidth(300);
+        _propertiesPanel->setMaximumWidth(360);
+
+        auto* layout = new QVBoxLayout(_propertiesPanel);
+        layout->setContentsMargins(6, 6, 6, 6);
+
+        _propertiesTitle = new QLabel("节点参数", _propertiesPanel);
+        layout->addWidget(_propertiesTitle);
+
+        _propertiesTable = new QTableView(_propertiesPanel);
+        _propertiesModel.setHorizontalHeaderLabels({ "Property", "Value" });
+        _propertiesTable->verticalHeader()->hide();
+        _propertiesTable->setSelectionBehavior(QAbstractItemView::SelectRows);
+        _propertiesTable->horizontalHeader()->setStretchLastSection(true);
+        _propertiesTable->setModel(&_propertiesModel);
+        layout->addWidget(_propertiesTable, 1);
+
+        auto* buttonsLayout = new QHBoxLayout();
+        auto* applyButton = new QPushButton("应用", _propertiesPanel);
+        auto* closeButton = new QPushButton("关闭", _propertiesPanel);
+        buttonsLayout->addWidget(applyButton);
+        buttonsLayout->addWidget(closeButton);
+        layout->addLayout(buttonsLayout);
+
+        connect(applyButton, &QPushButton::clicked, [this]() { applyProperties(); });
+        connect(closeButton, &QPushButton::clicked, [this]() { clearPropertiesPanel(); });
+
+        _propertiesPanel->hide();
+    }
+
+    void openProperties(QtNodes::Node& node)
+    {
+        auto& component = getComponent(node);
+        auto conf = component.getQConfig();
+        if (!conf) {
+            return;
+        }
+
+        _activeNode = &node;
+        _activeConfig = conf;
+        _activeConfig->setProperty("name", node.nodeDataModel()->caption());
+        _propertiesTitle->setText(node.nodeDataModel()->name() + " 参数");
+        _propertiesModel.removeRows(0, _propertiesModel.rowCount());
+
+        auto prop = _activeConfig->property("exposedProperties");
+        for (const auto& p : prop.toStringList()) {
+            if (p.isEmpty()) {
+                continue;
+            }
+
+            QList<QStandardItem*> row;
+            auto* propName = new QStandardItem(p);
+            propName->setFlags(Qt::NoItemFlags);
+            row.append(propName);
+            row.append(new QStandardItem(_activeConfig->property(p.toStdString().c_str()).toString()));
+            _propertiesModel.appendRow(row);
+
+            auto w = _activeConfig->findChild<PropertyField*>(p + "Widget");
+            if (w) {
+                if (w->propText().length() == 0) {
+                    w->setPropText(_activeConfig->property(p.toStdString().c_str()).toString());
+                }
+                auto idx = _propertiesModel.index(_propertiesModel.rowCount() - 1, 1);
+                _propertiesTable->setIndexWidget(idx, w);
+            }
+        }
+
+        _propertiesPanel->show();
+    }
+
+    void applyProperties()
+    {
+        if (_activeNode == nullptr) {
+            return;
+        }
+
+        std::shared_ptr<QWidget> conf = std::make_shared<QWidget>();
+        for (int i = 0; i < _propertiesModel.rowCount(); ++i) {
+            auto&& propName = _propertiesModel.item(i, 0)->data(Qt::DisplayRole).toString().toStdString();
+            auto* w = static_cast<PropertyField*>(_propertiesTable->indexWidget(_propertiesModel.index(i, 1)));
+            auto propVal = w ? w->propText() : _propertiesModel.item(i, 1)->text();
+            conf->setProperty(propName.c_str(), propVal);
+        }
+
+        auto& iface = getComponentModel(*_activeNode);
+        auto nodeCaption = conf->property("name");
+        if (nodeCaption.isValid()) {
+            iface.setCaption(nodeCaption.toString());
+            _activeNode->nodeGraphicsObject().update();
+        }
+
+        auto& component = getComponent(*_activeNode);
+        component.setConfig(*conf);
+        component.configChanged();
+
+        QJsonObject msg = initBcast(*_activeNode);
+        msg["msg"] = BcastMsg::ConfigChanged;
+
+        QJsonObject confObj;
+        auto prop = _activeConfig->property("exposedProperties");
+        for (const auto& p : prop.toStringList()) {
+            confObj[p] = conf->property(p.toStdString().c_str()).toString();
+        }
+
+        msg["config"] = confObj;
+
+        emit simBcast(msg);
+    }
+
+    void clearPropertiesPanel()
+    {
+        _activeNode = nullptr;
+        _activeConfig.reset();
+        _propertiesModel.removeRows(0, _propertiesModel.rowCount());
+        _propertiesPanel->hide();
+    }
+
 public:
     bool _simStarted{ false };
 
@@ -272,5 +406,11 @@ private:
     ProjectConfig* q_ptr;
     bool _darkMode;
     Plugins _plugins;
+    QWidget* _propertiesPanel{ nullptr };
+    QLabel* _propertiesTitle{ nullptr };
+    QTableView* _propertiesTable{ nullptr };
+    QStandardItemModel _propertiesModel;
+    QtNodes::Node* _activeNode{ nullptr };
+    std::shared_ptr<QWidget> _activeConfig;
 };
 #endif // PROJECTCONFIG_P_H

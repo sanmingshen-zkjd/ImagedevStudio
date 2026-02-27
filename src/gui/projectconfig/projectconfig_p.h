@@ -160,12 +160,15 @@ public:
 
         cds_debug("Node '{}' double clicked", node.nodeDataModel()->caption().toStdString());
 
+        if (!_simStarted) {
+            // Keep parameter editing consistent with the new UX:
+            // always open the inline right-side properties panel.
+            openProperties(node);
+            return;
+        }
+
         if (component.mainWidget() != nullptr) {
             openWidget(node);
-        } else {
-            if (!_simStarted) {
-                openProperties(node);
-            }
         }
     }
 
